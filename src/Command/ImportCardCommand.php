@@ -10,7 +10,7 @@ use Doctrine\ORM\EntityManagerInterface;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
-use Symfony\Component\Console\Helper\ProgressIndicator;
+use Symfony\Component\Console\Helper\ProgressBar;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
@@ -19,79 +19,187 @@ use Symfony\Component\Console\Style\SymfonyStyle;
 
 #[AsCommand(
     name: 'import:card',
-    description: 'Add a short description for your command',
+    description: 'Import Magic The Gathering cards from CSV file',
 )]
 class ImportCardCommand extends Command
 {
+    private const BATCH_SIZE = 100;
+
     public function __construct(
         private readonly EntityManagerInterface $entityManager,
         private readonly LoggerInterface        $logger,
-        private array                           $csvHeader = []
+        private readonly CardRepository         $cardRepository,
+        private readonly ArtistRepository       $artistRepository,
     )
     {
         parent::__construct();
     }
 
+    protected function configure(): void
+    {
+        $this
+            ->addOption('limit', 'l', InputOption::VALUE_OPTIONAL, 'Limit the number of cards to import', null);
+    }
+
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         ini_set('memory_limit', '2G');
-        // On récupère le temps actuel
         $io = new SymfonyStyle($input, $output);
         $filepath = __DIR__ . '/../../data/cards.csv';
-        $handle = fopen($filepath, 'r');
+        $limit = $input->getOption('limit') ? (int)$input->getOption('limit') : null;
 
-        // On récupère le temps actuel
         $start = microtime(true);
+        $this->logger->info('Starting card import', ['file' => $filepath, 'limit' => $limit]);
 
-        $this->logger->info('Importing cards from ' . $filepath);
+        $handle = fopen($filepath, 'r');
         if ($handle === false) {
-            $io->error('File not found');
+            $error = 'Failed to open file: ' . $filepath;
+            $this->logger->error($error);
+            $io->error($error);
             return Command::FAILURE;
         }
 
-        $i = 0;
-        $this->csvHeader = fgetcsv($handle);
-        $uuidInDatabase = $this->entityManager->getRepository(Card::class)->getAllUuids();
+        $csvHeader = fgetcsv($handle);
+        $uuidInDatabase = $this->cardRepository->getAllUuids();
+        $this->logger->info('Found existing cards', ['count' => count($uuidInDatabase)]);
 
-        $progressIndicator = new ProgressIndicator($output);
-        $progressIndicator->start('Importing cards...');
-
-        while (($row = $this->readCSV($handle)) !== false) {
-            $i++;
-
-            if (!in_array($row['uuid'], $uuidInDatabase)) {
-                $this->addCard($row);
-            }
-
-            if ($i % 2000 === 0) {
-                $this->entityManager->flush();
-                $this->entityManager->clear();
-                $progressIndicator->advance();
-            }
+        // Count total lines for progress bar
+        $totalLines = 0;
+        while (!feof($handle)) {
+            $totalLines += substr_count(fread($handle, 8192), "\n");
         }
-        // Toujours flush en sorti de boucle
-        $this->entityManager->flush();
-        $progressIndicator->finish('Importing cards done.');
+        rewind($handle);
+        fgetcsv($handle); // Skip header again
 
-        fclose($handle);
+        $progressBar = new ProgressBar($output, $totalLines);
+        $progressBar->setFormat('debug');
+        $progressBar->start();
 
-        // On récupère le temps actuel, et on calcule la différence avec le temps de départ
+        $i = 0;
+        $imported = 0;
+        $skipped = 0;
+        $artistsCreated = 0;
+        $memoryStart = memory_get_usage();
+
+        $artistCache = [];
+
+        try {
+            $this->entityManager->beginTransaction();
+
+            while (($row = $this->readCSV($handle, $csvHeader)) !== false) {
+                $i++;
+                $progressBar->advance();
+
+                if (!in_array($row['uuid'], $uuidInDatabase)) {
+                    // Handle artist
+                    $artistName = $row['artist'] ?? null;
+                    $artist = null;
+
+                    if ($artistName) {
+                        if (isset($artistCache[$artistName])) {
+                            $artist = $artistCache[$artistName];
+                        } else {
+                            $artist = $this->artistRepository->findOneBy(['name' => $artistName]);
+
+                            if (!$artist) {
+                                $artist = new Artist();
+                                $artist->setName($artistName);
+                                $artist->setArtistExternalId(md5($artistName)); // Utilisation d'un hash comme ID externe
+                                $this->entityManager->persist($artist);
+                                $artistsCreated++;
+
+                                $this->logger->debug('Created new artist', ['name' => $artistName]);
+                            }
+
+                            $artistCache[$artistName] = $artist;
+                        }
+                    }
+
+                    $this->addCard($row, $artist);
+                    $imported++;
+                } else {
+                    $skipped++;
+                }
+
+                if ($i % self::BATCH_SIZE === 0) {
+                    $this->entityManager->flush();
+                    $this->entityManager->clear();
+
+                    // Restore artist cache after clear
+                    foreach ($artistCache as $name => $artist) {
+                        $artistCache[$name] = $this->entityManager->merge($artist);
+                    }
+
+                    $memoryUsage = memory_get_usage();
+                    $this->logger->info('Import progress', [
+                        'processed' => $i,
+                        'imported' => $imported,
+                        'skipped' => $skipped,
+                        'artists_created' => $artistsCreated,
+                        'memory_usage' => $this->formatBytes($memoryUsage - $memoryStart)
+                    ]);
+
+                    $this->entityManager->beginTransaction();
+                }
+
+                if ($limit && $i >= $limit) {
+                    $this->logger->info('Import limit reached', ['limit' => $limit]);
+                    break;
+                }
+            }
+
+            $this->entityManager->flush();
+            $this->entityManager->commit();
+        } catch (\Exception $e) {
+            $this->entityManager->rollback();
+            $this->logger->error('Import failed', [
+                'error' => $e->getMessage(),
+                'line' => $i
+            ]);
+            throw $e;
+        } finally {
+            fclose($handle);
+        }
+
+        $progressBar->finish();
         $end = microtime(true);
         $timeElapsed = $end - $start;
-        $io->success(sprintf('Imported %d cards in %.2f seconds', $i, $timeElapsed));
+        $memoryPeak = memory_get_peak_usage() - $memoryStart;
+
+        $summary = [
+            'total_processed' => $i,
+            'imported' => $imported,
+            'skipped' => $skipped,
+            'artists_created' => $artistsCreated,
+            'time_elapsed' => round($timeElapsed, 2) . 's',
+            'memory_peak' => $this->formatBytes($memoryPeak)
+        ];
+
+        $this->logger->info('Import completed', $summary);
+        $io->newLine(2);
+        $io->success(sprintf(
+            'Processed %d cards in %.2f seconds (Imported: %d, Skipped: %d, Artists created: %d, Memory peak: %s)',
+            $i,
+            $timeElapsed,
+            $imported,
+            $skipped,
+            $artistsCreated,
+            $this->formatBytes($memoryPeak)
+        ));
+
         return Command::SUCCESS;
     }
 
-    private function readCSV(mixed $handle): array|false
+    private function readCSV(mixed $handle, array $csvHeader): array|false
     {
         $row = fgetcsv($handle);
         if ($row === false) {
             return false;
         }
-        return array_combine($this->csvHeader, $row);
+        return array_combine($csvHeader, $row);
     }
 
-    private function addCard(array $row)
+    private function addCard(array $row, ?Artist $artist): void
     {
         $uuid = $row['uuid'];
 
@@ -105,7 +213,21 @@ class ImportCardCommand extends Command
         $card->setSubtype($row['subtypes']);
         $card->setText($row['text']);
         $card->setType($row['type']);
-        $this->entityManager->persist($card);
 
+        if ($artist) {
+            $card->setArtist($artist);
+        }
+
+        $this->entityManager->persist($card);
+    }
+
+    private function formatBytes(int $bytes): string
+    {
+        $units = ['B', 'KB', 'MB', 'GB'];
+        $bytes = max($bytes, 0);
+        $pow = floor(($bytes ? log($bytes) : 0) / log(1024));
+        $pow = min($pow, count($units) - 1);
+
+        return round($bytes / (1024 ** $pow), 2) . ' ' . $units[$pow];
     }
 }
